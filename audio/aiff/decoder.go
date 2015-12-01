@@ -6,24 +6,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"sync"
 	"time"
 
 	"github.com/mattetti/exp/audio"
 )
 
-var (
-	defaultChunkDecoderTimeout = 2 * time.Second
-)
-
 // Decoder is the wrapper structure for the AIFF container
 type Decoder struct {
 	r io.Reader
-	// Chan is an Optional channel of chunks that is used to parse chunks
-	Chan chan *Chunk
-	// The waitgroup is used to let the parser that it's ok to continue
-	// after a chunk was passed to the optional parser channel.
-	Wg sync.WaitGroup
 	// ID is always 'FORM'. This indicates that this is a FORM chunk
 	ID [4]byte
 	// Size contains the size of data portion of the 'FORM' chunk.
@@ -47,12 +37,6 @@ type Decoder struct {
 	EncodingName string
 }
 
-// NewDecoder creates a new reader reading the given reader and pushing audio data to the given channel.
-// It is the caller's responsibility to call Close on the Decoder when done.
-func NewDecoder(r io.Reader, c chan *Chunk) *Decoder {
-	return &Decoder{r: r, Chan: c}
-}
-
 // Decode reads from a Read Seeker and converts the input to a PCM
 // clip output.
 func Decode(r io.ReadSeeker) (audio.Clip, error) {
@@ -68,7 +52,7 @@ func Decode(r io.ReadSeeker) (audio.Clip, error) {
 	var err error
 	var rewindBytes int64
 	for err != io.EOF {
-		id, size, err := d.IDnSize()
+		id, size, err := d.iDnSize()
 		if err != nil {
 			break
 		}
@@ -90,7 +74,9 @@ func Decode(r io.ReadSeeker) (audio.Clip, error) {
 			// if we didn't read the COMM, we are going to need to come back
 			if clip.sampleRate == 0 {
 				rewindBytes += int64(size)
-				d.dispatchToChan(id, size)
+				if err := d.jumpTo(int(size)); err != nil {
+					return nil, err
+				}
 			} else {
 				break
 			}
@@ -99,7 +85,9 @@ func Decode(r io.ReadSeeker) (audio.Clip, error) {
 			if clip.size != 0 {
 				rewindBytes += int64(size)
 			}
-			d.dispatchToChan(id, size)
+			if err := d.jumpTo(int(size)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	clip.r = r
@@ -113,20 +101,6 @@ func (d *Decoder) Duration() (time.Duration, error) {
 	}
 	duration := time.Duration(float64(d.NumSampleFrames) / float64(d.SampleRate) * float64(time.Second))
 	return duration, nil
-}
-
-// String implements the Stringer interface.
-func (d *Decoder) String() string {
-	out := fmt.Sprintf("Format: %s - ", d.Format)
-	if d.Format == aifcID {
-		out += fmt.Sprintf("%s - ", d.EncodingName)
-	}
-	if d.SampleRate != 0 {
-		out += fmt.Sprintf("%d channels @ %d / %d bits - ", d.NumChans, d.SampleRate, d.SampleSize)
-		dur, _ := d.Duration()
-		out += fmt.Sprintf("Duration: %f seconds\n", dur.Seconds())
-	}
-	return out
 }
 
 func (d *Decoder) readHeaders() error {
@@ -192,23 +166,8 @@ func (d *Decoder) parseCommChunk(size uint32) error {
 
 }
 
-func (d *Decoder) dispatchToChan(id [4]byte, size uint32) error {
-	if d.Chan == nil {
-		if err := d.jumpTo(int(size)); err != nil {
-			return err
-		}
-		return nil
-	}
-	okC := make(chan bool)
-	d.Wg.Add(1)
-	d.Chan <- &Chunk{ID: id, Size: int(size), R: d.r, okChan: okC, Wg: &d.Wg}
-	d.Wg.Wait()
-	// TODO: timeout
-	return nil
-}
-
-// IDnSize returns the next ID + block size
-func (d *Decoder) IDnSize() ([4]byte, uint32, error) {
+// iDnSize returns the next ID + block size
+func (d *Decoder) iDnSize() ([4]byte, uint32, error) {
 	var ID [4]byte
 	var blockSize uint32
 	if err := binary.Read(d.r, binary.BigEndian, &ID); err != nil {
